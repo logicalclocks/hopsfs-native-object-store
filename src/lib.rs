@@ -289,7 +289,10 @@ impl ObjectStore for HdfsObjectStore {
             location: location.clone(),
             last_modified: DateTime::<Utc>::from_timestamp(status.modification_time as i64, 0)
                 .unwrap(),
-            size: status.length,
+            size: status
+                .length
+                .try_into()
+                .expect("unable to convert status.length to usize"),
             e_tag: None,
             version: None,
         })
@@ -607,7 +610,10 @@ fn get_object_meta(status: &FileStatus) -> Result<ObjectMeta> {
     Ok(ObjectMeta {
         location: Path::parse(&status.path)?,
         last_modified: DateTime::<Utc>::from_timestamp(status.modification_time as i64, 0).unwrap(),
-        size: status.length,
+        size: status
+            .length
+            .try_into()
+            .expect("unable to convert status.length to usize"),
         e_tag: None,
         version: None,
     })
