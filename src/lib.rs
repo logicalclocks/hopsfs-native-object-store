@@ -256,8 +256,17 @@ impl ObjectStore for HdfsObjectStore {
             .await
             .to_object_store_err()?;
 
+        let start: usize = range
+            .start
+            .try_into()
+            .expect("unable to convert range.start to usize");
+        let end: usize = range
+            .end
+            .try_into()
+            .expect("unable to convert range.end to usize");
+
         let connection = self.client.get_connection();
-        let stream = ReadRangeStream::new(connection, reader.file, range.start, range.end);
+        let stream = ReadRangeStream::new(connection, reader.file, start, end);
         let box_stream = stream.map(|b| b.to_object_store_err()).boxed();
 
         let payload = GetResultPayload::Stream(box_stream);
@@ -322,7 +331,7 @@ impl ObjectStore for HdfsObjectStore {
     /// `foo/bar_baz/x`.
     ///
     /// Note: the order of returned [`ObjectMeta`] is not guaranteed
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, Result<ObjectMeta>> {
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         let start_prefix = prefix.map(make_absolute_dir).unwrap_or("".to_string());
         let client = Arc::clone(&self.client);
 
