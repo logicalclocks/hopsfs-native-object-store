@@ -1,15 +1,13 @@
-// #![warn(missing_docs)]
 //! [object_store::ObjectStore] implementation for the Native Rust HDFS client
 //!
 //! # Usage
 //!
 //! ```rust
-//! use hdfs_native_object_store::HdfsObjectStore;
-//! # use object_store::Result;
-//! # fn main() -> Result<()> {
-//! let store = HdfsObjectStore::with_url("hdfs://localhost:9000")?;
-//! # Ok(())
-//! # }
+//! use hdfs_native_object_store::HdfsObjectStoreBuilder;
+//! let store = HdfsObjectStoreBuilder::new()
+//!     .with_url("hdfs://localhost:9000")
+//!     .build()
+//!     .unwrap();
 //! ```
 //!
 use std::{
@@ -17,22 +15,25 @@ use std::{
     fmt::{Display, Formatter},
     future,
     path::PathBuf,
-    sync::Arc,
 };
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::{
-    stream::{BoxStream, StreamExt},
     FutureExt,
+    stream::{BoxStream, StreamExt},
 };
-use hdfs_native::{client::FileStatus, file::FileWriter, Client, HdfsError, WriteOptions};
+use hdfs_native::{
+    Client, ClientBuilder, HdfsError, WriteOptions, client::FileStatus, file::FileWriter,
+};
+use object_store::{CopyMode, CopyOptions, RenameOptions, RenameTargetMode};
+#[allow(deprecated)]
 use object_store::{
-    path::Path, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMode, PutMultipartOpts, PutOptions, PutPayload, PutResult, Result,
-    UploadPart,
+    GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMode, PutMultipartOpts, PutOptions, PutPayload, PutResult, Result, UploadPart, path::Path,
 };
 use tokio::{
+    runtime::Handle,
     sync::{mpsc, oneshot},
     task::{self, JoinHandle},
 };
@@ -41,22 +42,73 @@ use tokio::{
 #[cfg(feature = "integration-test")]
 pub use hdfs_native::minidfs;
 
-#[derive(Debug)]
+fn generic_error(
+    source: Box<dyn std::error::Error + Send + Sync + 'static>,
+) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "HFDS",
+        source,
+    }
+}
+
+/// Builder for creating an [HdfsObjectStore]
+#[derive(Default)]
+pub struct HdfsObjectStoreBuilder {
+    inner: ClientBuilder,
+}
+
+impl HdfsObjectStoreBuilder {
+    /// Create a new [HdfsObjectStoreBuilder]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the URL to connect to. Can be the address of a single NameNode, or a logical NameService
+    pub fn with_url(mut self, url: impl Into<String>) -> Self {
+        self.inner = self.inner.with_url(url);
+        self
+    }
+
+    /// Set configs to use for the client. The provided configs will override any found in the default config files loaded
+    pub fn with_config(
+        mut self,
+        config: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        self.inner = self.inner.with_config(config);
+        self
+    }
+
+    // Use a dedicated tokio runtime for spawned tasks and IO operations
+    pub fn with_io_runtime(mut self, runtime: Handle) -> Self {
+        self.inner = self.inner.with_io_runtime(runtime);
+        self
+    }
+
+    /// Create the [HdfsObjectStore]] instance from the provided settings
+    pub fn build(self) -> Result<HdfsObjectStore> {
+        let client = self.inner.build().to_object_store_err()?;
+
+        Ok(HdfsObjectStore { client })
+    }
+}
+
+/// Interface for [Hadoop Distributed File System](https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-hdfs/HdfsDesign.html).
+#[derive(Debug, Clone)]
 pub struct HdfsObjectStore {
-    client: Arc<Client>,
+    client: Client,
 }
 
 impl HdfsObjectStore {
-    /// Creates a new HdfsObjectStore from an existing [Client]
+    /// Creates a new HdfsObjectStore from an existing `hdfs-native` [Client]
     ///
     /// ```rust
     /// # use std::sync::Arc;
-    /// use hdfs_native::Client;
+    /// use hdfs_native::ClientBuilder;
     /// # use hdfs_native_object_store::HdfsObjectStore;
-    /// let client = Client::new("hdfs://127.0.0.1:9000").unwrap();
-    /// let store = HdfsObjectStore::new(Arc::new(client));
+    /// let client = ClientBuilder::new().with_url("hdfs://127.0.0.1:9000").build().unwrap();
+    /// let store = HdfsObjectStore::new(client);
     /// ```
-    pub fn new(client: Arc<Client>) -> Self {
+    pub fn new(client: Client) -> Self {
         Self { client }
     }
 
@@ -70,8 +122,14 @@ impl HdfsObjectStore {
     /// # Ok(())
     /// # }
     /// ```
+    #[deprecated(since = "0.15.0", note = "Use HdfsObjectStoreBuilder instead")]
     pub fn with_url(url: &str) -> Result<Self> {
-        Ok(Self::new(Arc::new(Client::new(url).to_object_store_err()?)))
+        let client = ClientBuilder::new()
+            .with_url(url)
+            .build()
+            .to_object_store_err()?;
+
+        Ok(Self { client })
     }
 
     /// Creates a new HdfsObjectStore using the specified URL and Hadoop configs.
@@ -90,44 +148,15 @@ impl HdfsObjectStore {
     /// # Ok(())
     /// # }
     /// ```
+    #[deprecated(since = "0.15.0", note = "Use HdfsObjectStoreBuilder instead")]
     pub fn with_config(url: &str, config: HashMap<String, String>) -> Result<Self> {
-        Ok(Self::new(Arc::new(
-            Client::new_with_config(url, config).to_object_store_err()?,
-        )))
-    }
-
-    async fn internal_copy(&self, from: &Path, to: &Path, overwrite: bool) -> Result<()> {
-        let overwrite = match self.client.get_file_info(&make_absolute_file(to)).await {
-            Ok(_) if overwrite => true,
-            Ok(_) => Err(HdfsError::AlreadyExists(make_absolute_file(to))).to_object_store_err()?,
-            Err(HdfsError::FileNotFound(_)) => false,
-            Err(e) => Err(e).to_object_store_err()?,
-        };
-
-        let write_options = WriteOptions {
-            overwrite,
-            ..Default::default()
-        };
-
-        let file = self
-            .client
-            .read(&make_absolute_file(from))
-            .await
-            .to_object_store_err()?;
-        let mut stream = file.read_range_stream(0, file.file_length()).boxed();
-
-        let mut new_file = self
-            .client
-            .create(&make_absolute_file(to), write_options)
-            .await
+        let client = ClientBuilder::new()
+            .with_url(url)
+            .with_config(config)
+            .build()
             .to_object_store_err()?;
 
-        while let Some(bytes) = stream.next().await.transpose().to_object_store_err()? {
-            new_file.write(bytes).await.to_object_store_err()?;
-        }
-        new_file.close().await.to_object_store_err()?;
-
-        Ok(())
+        Ok(Self { client })
     }
 
     async fn open_tmp_file(&self, file_path: &str) -> Result<(FileWriter, String)> {
@@ -143,7 +172,7 @@ impl HdfsObjectStore {
             .to_string();
 
         let tmp_file_path = path_buf
-            .with_file_name(format!(".{}.tmp", file_name))
+            .with_file_name(format!(".{file_name}.tmp"))
             .to_str()
             .ok_or(HdfsError::InvalidPath("path not valid unicode".to_string()))
             .to_object_store_err()?
@@ -152,7 +181,7 @@ impl HdfsObjectStore {
         // Try to create a file with an incrementing index until we find one that doesn't exist yet
         let mut index = 1;
         loop {
-            let path = format!("{}.{}", tmp_file_path, index);
+            let path = format!("{tmp_file_path}.{index}");
             match self.client.create(&path, WriteOptions::default()).await {
                 Ok(writer) => break Ok((writer, path)),
                 Err(HdfsError::AlreadyExists(_)) => index += 1,
@@ -170,7 +199,7 @@ impl Display for HdfsObjectStore {
 
 impl From<Client> for HdfsObjectStore {
     fn from(value: Client) -> Self {
-        Self::new(Arc::new(value))
+        Self { client: value }
     }
 }
 
@@ -191,9 +220,10 @@ impl ObjectStore for HdfsObjectStore {
             PutMode::Create => false,
             PutMode::Overwrite => true,
             PutMode::Update(_) => {
-                return Err(object_store::Error::NotSupported {
-                    source: "Update mode not supported".to_string().into(),
-                })
+                return Err(object_store::Error::NotImplemented {
+                    operation: "PutOptions with Update precondition".to_string(),
+                    implementer: "HdfsObjectStore".to_string(),
+                });
             }
         };
 
@@ -218,14 +248,21 @@ impl ObjectStore for HdfsObjectStore {
             .await
             .to_object_store_err()?;
 
+        let e_tag = self
+            .get_opts(location, GetOptions::default().with_head(true))
+            .await?
+            .meta
+            .e_tag;
+
         Ok(PutResult {
-            e_tag: None,
+            e_tag,
             version: None,
         })
     }
 
     /// Create a multipart writer that writes to a temporary file in a background task, and renames
     /// to the final destination on complete.
+    #[allow(deprecated)]
     async fn put_multipart_opts(
         &self,
         location: &Path,
@@ -236,7 +273,7 @@ impl ObjectStore for HdfsObjectStore {
         let (tmp_file, tmp_file_path) = self.open_tmp_file(&final_file_path).await?;
 
         Ok(Box::new(HdfsMultipartWriter::new(
-            Arc::clone(&self.client),
+            self.client.clone(),
             tmp_file,
             &tmp_file_path,
             &final_file_path,
@@ -245,44 +282,56 @@ impl ObjectStore for HdfsObjectStore {
 
     /// Reads data for the specified location.
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-        if options.if_match.is_some()
-            || options.if_none_match.is_some()
-            || options.if_modified_since.is_some()
-            || options.if_unmodified_since.is_some()
-        {
-            return Err(object_store::Error::NotImplemented);
-        }
-
-        let meta = self.head(location).await?;
-
-        let range = options
-            .range
-            .map(|r| match r {
-                GetRange::Bounded(range) => range,
-                GetRange::Offset(offset) => offset..meta.size,
-                GetRange::Suffix(suffix) => meta.size.saturating_sub(suffix)..meta.size,
-            })
-            .unwrap_or(0..meta.size);
-
-        let reader = self
+        let status = self
             .client
-            .read(&make_absolute_file(location))
+            .get_file_info(&make_absolute_file(location))
             .await
             .to_object_store_err()?;
-        let start: usize = range
-            .start
-            .try_into()
-            .expect("unable to convert range.start to usize");
-        let end: usize = range
-            .end
-            .try_into()
-            .expect("unable to convert range.end to usize");
-        let stream = reader
-            .read_range_stream(start, end - start)
-            .map(|b| b.to_object_store_err())
-            .boxed();
 
-        let payload = GetResultPayload::Stream(stream);
+        if status.isdir {
+            return Err(object_store::Error::NotFound {
+                path: location.to_string(),
+                source: "Head cannot be called on a directory".into(),
+            });
+        }
+
+        let meta = get_object_meta(&status)?;
+
+        options.check_preconditions(&meta)?;
+
+        let (range, payload) = if options.head {
+            (
+                (0..0),
+                GetResultPayload::Stream(futures::stream::empty().boxed()),
+            )
+        } else {
+            let range = options
+                .range
+                .map(|r| r.as_range(meta.size))
+                .transpose()
+                .map_err(|source| generic_error(source.into()))?
+                .unwrap_or(0..meta.size);
+
+            let reader = self
+                .client
+                .read(&make_absolute_file(location))
+                .await
+                .to_object_store_err()?;
+            let start: usize = range
+                .start
+                .try_into()
+                .expect("unable to convert range.start to usize");
+            let end: usize = range
+                .end
+                .try_into()
+                .expect("unable to convert range.end to usize");
+            let stream = reader
+                .read_range_stream(start, end - start)
+                .map(|b| b.to_object_store_err())
+                .boxed();
+
+            (range, GetResultPayload::Stream(stream))
+        };
 
         Ok(GetResult {
             payload,
@@ -292,50 +341,26 @@ impl ObjectStore for HdfsObjectStore {
         })
     }
 
-    /// Return the metadata for the specified location
-    async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-        let status = self
-            .client
-            .get_file_info(&make_absolute_file(location))
-            .await
-            .to_object_store_err()?;
-
-        if status.isdir {
-            return Err(HdfsError::IsADirectoryError(
-                "Head must be called on a file".to_string(),
-            ))
-            .to_object_store_err();
-        }
-
-        Ok(ObjectMeta {
-            location: location.clone(),
-            last_modified: DateTime::<Utc>::from_timestamp(status.modification_time as i64, 0)
-                .unwrap(),
-            size: status
-                .length
-                .try_into()
-                .expect("unable to convert status.length to usize"),
-            e_tag: None,
-            version: None,
-        })
-    }
-
-    /// Delete the object at the specified location.
-    async fn delete(&self, location: &Path) -> Result<()> {
-        let result = self
-            .client
-            .delete(&make_absolute_file(location), false)
-            .await
-            .to_object_store_err()?;
-
-        if !result {
-            Err(HdfsError::OperationFailed(
-                "failed to delete object".to_string(),
-            ))
-            .to_object_store_err()?
-        }
-
-        Ok(())
+    /// Delete a stream of objects.
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        let client = self.client.clone();
+        locations
+            .map(move |location| {
+                let client = client.clone();
+                async move {
+                    let location = location?;
+                    client
+                        .delete(&make_absolute_file(&location), false)
+                        .await
+                        .to_object_store_err()?;
+                    Ok(location)
+                }
+            })
+            .buffered(10)
+            .boxed()
     }
 
     /// List all the objects with the given prefix.
@@ -345,16 +370,17 @@ impl ObjectStore for HdfsObjectStore {
     ///
     /// Note: the order of returned [`ObjectMeta`] is not guaranteed
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        let absolute_dir = prefix.map(make_absolute_file).unwrap_or("/".to_string());
+
         let status_stream = self
             .client
-            .list_status_iter(
-                &prefix.map(make_absolute_dir).unwrap_or("".to_string()),
-                true,
-            )
+            .list_status_iter(&absolute_dir, true)
             .into_stream()
-            .filter(|res| {
+            .filter(move |res| {
                 let result = match res {
-                    Ok(status) => !status.isdir,
+                    // Directories aren't a thing in object stores so ignore them, and if a file is listed
+                    // directly that should be ignored as well
+                    Ok(status) => !status.isdir && status.path != absolute_dir,
                     // Listing by prefix should just return an empty list if the prefix isn't found
                     Err(HdfsError::FileNotFound(_)) => false,
                     _ => true,
@@ -373,15 +399,16 @@ impl ObjectStore for HdfsObjectStore {
     /// Prefixes are evaluated on a path segment basis, i.e. `foo/bar/` is a prefix of `foo/bar/x` but not of
     /// `foo/bar_baz/x`.
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        let absolute_dir = prefix.map(make_absolute_file).unwrap_or("/".to_string());
+
         let mut status_stream = self
             .client
-            .list_status_iter(
-                &prefix.map(make_absolute_dir).unwrap_or("".to_string()),
-                false,
-            )
+            .list_status_iter(&absolute_dir, false)
             .into_stream()
-            .filter(|res| {
+            .filter(move |res| {
                 let result = match res {
+                    // If a file is listed directly it should be ignored
+                    Ok(status) => status.path != absolute_dir,
                     // Listing by prefix should just return an empty list if the prefix isn't found
                     Err(HdfsError::FileNotFound(_)) => false,
                     _ => true,
@@ -410,50 +437,79 @@ impl ObjectStore for HdfsObjectStore {
         })
     }
 
-    /// Renames a file. This operation is guaranteed to be atomic.
-    async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
+        // Make sure the parent directory exists
+        let mut parent: Vec<_> = to.parts().collect();
+        parent.pop();
+
+        if !parent.is_empty() {
+            let parent_path: Path = parent.into_iter().collect();
+            self.client
+                .mkdirs(&make_absolute_dir(&parent_path), 0o755, true)
+                .await
+                .to_object_store_err()?;
+        }
+
+        let overwrite = match options.target_mode {
+            RenameTargetMode::Overwrite => true,
+            RenameTargetMode::Create => false,
+        };
+
         Ok(self
             .client
-            .rename(&make_absolute_file(from), &make_absolute_file(to), true)
+            .rename(
+                &make_absolute_file(from),
+                &make_absolute_file(to),
+                overwrite,
+            )
             .await
             .to_object_store_err()?)
     }
 
-    /// Renames a file only if the distination doesn't exist. This operation is guaranteed
-    /// to be atomic.
-    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        Ok(self
+    /// Copy an object from one path to another with options.
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+        let overwrite = match options.mode {
+            CopyMode::Create => {
+                // Eagerly check if the target file exists first before wasting time copying
+                match self.client.get_file_info(&make_absolute_file(to)).await {
+                    Ok(_) => {
+                        return Err(HdfsError::AlreadyExists(make_absolute_file(to)))
+                            .to_object_store_err();
+                    }
+                    Err(HdfsError::FileNotFound(_)) => false,
+                    Err(e) => return Err(e).to_object_store_err(),
+                }
+            }
+            CopyMode::Overwrite => true,
+        };
+
+        let write_options = WriteOptions {
+            overwrite,
+            ..Default::default()
+        };
+
+        let file = self
             .client
-            .rename(&make_absolute_file(from), &make_absolute_file(to), false)
+            .read(&make_absolute_file(from))
             .await
-            .to_object_store_err()?)
-    }
+            .to_object_store_err()?;
+        let mut stream = file.read_range_stream(0, file.file_length()).boxed();
 
-    /// Copy an object from one path to another in the same object store.
-    ///
-    /// If there exists an object at the destination, it will be overwritten.
-    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
-        self.internal_copy(from, to, true).await
-    }
+        let mut new_file = self
+            .client
+            .create(&make_absolute_file(to), write_options)
+            .await
+            .to_object_store_err()?;
 
-    /// Copy an object from one path to another, only if destination is empty.
-    ///
-    /// Will return an error if the destination already has an object.
-    ///
-    /// Performs an atomic operation if the underlying object storage supports it.
-    /// If atomic operations are not supported by the underlying object storage (like S3)
-    /// it will return an error.
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        self.internal_copy(from, to, false).await
+        while let Some(bytes) = stream.next().await.transpose().to_object_store_err()? {
+            new_file.write(bytes).await.to_object_store_err()?;
+        }
+        new_file.close().await.to_object_store_err()?;
+
+        Ok(())
     }
 }
 
-#[cfg(feature = "integration-test")]
-pub trait HdfsErrorConvert<T> {
-    fn to_object_store_err(self) -> Result<T>;
-}
-
-#[cfg(not(feature = "integration-test"))]
 trait HdfsErrorConvert<T> {
     fn to_object_store_err(self) -> Result<T>;
 }
@@ -484,19 +540,14 @@ type PartSender = mpsc::UnboundedSender<(oneshot::Sender<Result<()>>, PutPayload
 // A once cell is used to track whether a part has finished writing or not.
 // On completing, rename the file to the actual target.
 struct HdfsMultipartWriter {
-    client: Arc<Client>,
+    client: Client,
     sender: Option<(JoinHandle<Result<()>>, PartSender)>,
     tmp_filename: String,
     final_filename: String,
 }
 
 impl HdfsMultipartWriter {
-    fn new(
-        client: Arc<Client>,
-        writer: FileWriter,
-        tmp_filename: &str,
-        final_filename: &str,
-    ) -> Self {
+    fn new(client: Client, writer: FileWriter, tmp_filename: &str, final_filename: &str) -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
 
         Self {
@@ -512,36 +563,20 @@ impl HdfsMultipartWriter {
         mut part_receiver: mpsc::UnboundedReceiver<(oneshot::Sender<Result<()>>, PutPayload)>,
     ) -> JoinHandle<Result<()>> {
         task::spawn(async move {
-            'outer: loop {
+            loop {
                 match part_receiver.recv().await {
                     Some((sender, part)) => {
                         for bytes in part {
-                            if let Err(e) = writer.write(bytes).await.to_object_store_err() {
-                                let _ = sender.send(Err(e));
-                                break 'outer;
+                            if let Err(e) = writer.write(bytes).await {
+                                let _ = sender.send(Err(e).to_object_store_err());
+                                return Err(generic_error("Failed to write all parts".into()));
                             }
                         }
                         let _ = sender.send(Ok(()));
                     }
-                    None => {
-                        return writer.close().await.to_object_store_err();
-                    }
+                    None => return writer.close().await.to_object_store_err(),
                 }
             }
-
-            // If we've reached here, a write task failed so just return Err's for all new parts that come in
-            while let Some((sender, _)) = part_receiver.recv().await {
-                let _ = sender.send(
-                    Err(HdfsError::OperationFailed(
-                        "Write failed during one of the parts".to_string(),
-                    ))
-                    .to_object_store_err(),
-                );
-            }
-            Err(HdfsError::OperationFailed(
-                "Write failed during one of the parts".to_string(),
-            ))
-            .to_object_store_err()
         })
     }
 }
@@ -561,19 +596,23 @@ impl MultipartUpload for HdfsMultipartWriter {
         let (result_sender, result_receiver) = oneshot::channel();
 
         if let Some((_, payload_sender)) = self.sender.as_ref() {
-            payload_sender.send((result_sender, payload)).unwrap();
+            if let Err(mpsc::error::SendError((result_sender, _))) =
+                payload_sender.send((result_sender, payload))
+            {
+                let _ = result_sender.send(Err(generic_error("Write task failed".into())));
+            }
         } else {
-            result_sender
-                .send(
-                    Err(HdfsError::OperationFailed(
-                        "Cannot put part after completing or aborting".to_string(),
-                    ))
-                    .to_object_store_err(),
-                )
-                .unwrap();
+            let _ = result_sender.send(Err(generic_error(
+                "Cannot put part after completing or aborting".into(),
+            )));
         }
 
-        async { result_receiver.await.unwrap() }.boxed()
+        async {
+            result_receiver
+                .await
+                .unwrap_or_else(|_| Err(generic_error("Write task failed".into())))
+        }
+        .boxed()
     }
 
     async fn complete(&mut self) -> Result<PutResult> {
@@ -594,9 +633,9 @@ impl MultipartUpload for HdfsMultipartWriter {
                 version: None,
             })
         } else {
-            Err(object_store::Error::NotSupported {
-                source: "Cannot call abort or complete multiple times".into(),
-            })
+            Err(generic_error(
+                "Cannot call abort or complete multiple times".into(),
+            ))
         }
     }
 
@@ -615,9 +654,9 @@ impl MultipartUpload for HdfsMultipartWriter {
 
             Ok(())
         } else {
-            Err(object_store::Error::NotSupported {
-                source: "Cannot call abort or complete multiple times".into(),
-            })
+            Err(generic_error(
+                "Cannot call abort or complete multiple times".into(),
+            ))
         }
     }
 }
@@ -635,15 +674,85 @@ fn make_absolute_dir(path: &Path) -> String {
     }
 }
 
+fn get_etag(status: &FileStatus) -> String {
+    let size = status.length;
+    let mtime = status.modification_time;
+
+    // Use an ETag scheme based on that used by many popular HTTP servers
+    // <https://httpd.apache.org/docs/2.2/mod/core.html#fileetag>
+    // <https://stackoverflow.com/questions/47512043/how-etags-are-generated-and-configured>
+    format!("{mtime:x}-{size:x}")
+}
+
 fn get_object_meta(status: &FileStatus) -> Result<ObjectMeta> {
     Ok(ObjectMeta {
         location: Path::parse(&status.path)?,
-        last_modified: DateTime::<Utc>::from_timestamp(status.modification_time as i64, 0).unwrap(),
-        size: status
-            .length
-            .try_into()
-            .expect("unable to convert status.length to usize"),
-        e_tag: None,
+        last_modified: DateTime::<Utc>::from_timestamp_millis(status.modification_time as i64)
+            .ok_or(generic_error(
+                "Last modified timestamp out of bounds".into(),
+            ))?,
+        size: status.length as u64,
+        e_tag: Some(get_etag(status)),
         version: None,
     })
+}
+
+#[cfg(test)]
+#[cfg(feature = "integration-test")]
+mod test {
+    use std::collections::HashSet;
+
+    use object_store::integration::*;
+    use serial_test::serial;
+    use tokio::runtime::Runtime;
+
+    use crate::HdfsObjectStoreBuilder;
+
+    #[tokio::test]
+    #[serial]
+    async fn hdfs_test() {
+        let dfs = hdfs_native::minidfs::MiniDfs::with_features(&HashSet::from([
+            hdfs_native::minidfs::DfsFeatures::HA,
+        ]));
+
+        let integration = HdfsObjectStoreBuilder::new()
+            .with_url(&dfs.url)
+            .build()
+            .unwrap();
+
+        put_get_delete_list(&integration).await;
+        list_uses_directories_correctly(&integration).await;
+        list_with_delimiter(&integration).await;
+        rename_and_copy(&integration).await;
+        copy_if_not_exists(&integration).await;
+        multipart_race_condition(&integration, true).await;
+        multipart_out_of_order(&integration).await;
+        get_opts(&integration).await;
+        put_opts(&integration, false).await;
+    }
+
+    #[test]
+    #[serial]
+    fn test_no_tokio() {
+        let dfs = hdfs_native::minidfs::MiniDfs::with_features(&HashSet::from([
+            hdfs_native::minidfs::DfsFeatures::HA,
+        ]));
+
+        let integration = HdfsObjectStoreBuilder::new()
+            .with_url(&dfs.url)
+            .build()
+            .unwrap();
+
+        futures::executor::block_on(get_opts(&integration));
+
+        let rt = Runtime::new().unwrap();
+
+        let integration = HdfsObjectStoreBuilder::new()
+            .with_url(&dfs.url)
+            .with_io_runtime(rt.handle().clone())
+            .build()
+            .unwrap();
+
+        futures::executor::block_on(get_opts(&integration));
+    }
 }
