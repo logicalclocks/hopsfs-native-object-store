@@ -285,8 +285,10 @@ impl ObjectStore for HdfsObjectStore {
             .await
             .to_object_store_err()?;
 
+        let e_tag = self.head(location).await?.e_tag;
+
         Ok(PutResult {
-            e_tag: None,
+            e_tag,
             version: None,
         })
     }
@@ -385,7 +387,7 @@ impl ObjectStore for HdfsObjectStore {
                 .length
                 .try_into()
                 .expect("unable to convert status.length to usize"),
-            e_tag: None,
+            e_tag: Some(get_etag(&status)),
             version: None,
         })
     }
@@ -705,6 +707,14 @@ fn make_absolute_dir(path: &Path) -> String {
     }
 }
 
+/// Generate an ETag from file status using modification time and size.
+/// See: https://httpd.apache.org/docs/2.2/mod/core.html#fileetag
+fn get_etag(status: &FileStatus) -> String {
+    let size = status.length;
+    let mtime = status.modification_time;
+    format!("{mtime:x}-{size:x}")
+}
+
 fn get_object_meta(status: &FileStatus) -> Result<ObjectMeta> {
     Ok(ObjectMeta {
         location: Path::parse(&status.path)?,
@@ -713,7 +723,7 @@ fn get_object_meta(status: &FileStatus) -> Result<ObjectMeta> {
             .length
             .try_into()
             .expect("unable to convert status.length to usize"),
-        e_tag: None,
+        e_tag: Some(get_etag(status)),
         version: None,
     })
 }
