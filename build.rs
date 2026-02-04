@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn download_and_extract_libhdfs() -> Result<(), Box<dyn std::error::Error>> {
     let lib_dir = Path::new("lib");
 
-    // Skip download if feature is enabled and lib directory already has files
+    // Skip download if feature is enabled and lib directory already contains files
     if env::var("CARGO_FEATURE_SKIP_DOWNLOAD").is_ok() && lib_dir.exists() {
         let has_files = fs::read_dir(lib_dir)?.next().is_some();
         if has_files {
