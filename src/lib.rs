@@ -1,15 +1,13 @@
-// #![warn(missing_docs)]
-//! [ObjectStore] implementation for the Native Rust HDFS client
+//! [object_store::ObjectStore] implementation for HopsFS/HDFS using libhdfs Go client bindings
 //!
 //! # Usage
 //!
 //! ```rust
-//! use hdfs_native_object_store::HdfsObjectStore;
-//! # use object_store::Result;
-//! # fn main() -> Result<()> {
-//! let store = HdfsObjectStore::with_url("hdfs://localhost:8020")?;
-//! # Ok(())
-//! # }
+//! use hdfs_native_object_store::HdfsObjectStoreBuilder;
+//! let store = HdfsObjectStoreBuilder::new()
+//!     .with_url("hdfs://localhost:8020")
+//!     .build()
+//!     .unwrap();
 //! ```
 //!
 mod client;
@@ -24,6 +22,7 @@ use futures::{
     FutureExt,
 };
 use object_store::path::Error::InvalidPath;
+#[allow(deprecated)]
 use object_store::{
     path::Path, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload,
     ObjectMeta, ObjectStore, PutMode, PutMultipartOpts, PutOptions, PutPayload, PutResult, Result,
@@ -37,17 +36,94 @@ use std::{
     sync::Arc,
 };
 use tokio::{
+    runtime::Handle,
     sync::{mpsc, oneshot},
-    task::{self, JoinHandle},
+    task::JoinHandle,
 };
+
 pub type Client = HopsClient;
 
 use crate::client::ReadRangeStream;
 pub use crate::client::{FileStatus, FileWriter, HdfsError, WriteOptions};
 
+fn generic_error(
+    source: Box<dyn std::error::Error + Send + Sync + 'static>,
+) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "HdfsObjectStore",
+        source,
+    }
+}
+
+/// Builder for creating an [HdfsObjectStore]
+#[derive(Default)]
+pub struct HdfsObjectStoreBuilder {
+    url: Option<String>,
+    config: HashMap<String, String>,
+    io_runtime: Option<Handle>,
+}
+
+impl HdfsObjectStoreBuilder {
+    /// Create a new [HdfsObjectStoreBuilder]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the URL to connect to. Can be the address of a single NameNode, or a logical NameService
+    pub fn with_url(mut self, url: impl Into<String>) -> Self {
+        self.url = Some(url.into());
+        self
+    }
+
+    /// Set configs to use for the client. The provided configs will override any found in the default config files loaded
+    pub fn with_config(
+        mut self,
+        config: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        self.config = config
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+        self
+    }
+
+    /// Use a dedicated tokio runtime for spawned tasks and IO operations
+    pub fn with_io_runtime(mut self, runtime: Handle) -> Self {
+        self.io_runtime = Some(runtime);
+        self
+    }
+
+    /// Create the [HdfsObjectStore] instance from the provided settings
+    pub fn build(self) -> Result<HdfsObjectStore> {
+        let url = self.url.ok_or_else(|| generic_error("URL is required".into()))?;
+
+        let client = if self.config.is_empty() {
+            Client::new(&url, None, self.io_runtime.clone()).to_object_store_err()?
+        } else {
+            Client::new(&url, Some(self.config), self.io_runtime.clone()).to_object_store_err()?
+        };
+
+        Ok(HdfsObjectStore {
+            client: Arc::new(client),
+            io_runtime: self.io_runtime,
+        })
+    }
+}
+
+/// Interface for [Hadoop Distributed File System](https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-hdfs/HdfsDesign.html).
 #[derive(Debug)]
 pub struct HdfsObjectStore {
     client: Arc<Client>,
+    io_runtime: Option<Handle>,
+}
+
+impl Clone for HdfsObjectStore {
+    fn clone(&self) -> Self {
+        Self {
+            client: Arc::clone(&self.client),
+            io_runtime: self.io_runtime.clone(),
+        }
+    }
 }
 
 impl HdfsObjectStore {
@@ -60,7 +136,10 @@ impl HdfsObjectStore {
     /// let store = HdfsObjectStore::new(Arc::new(client));
     /// ```
     pub fn new(client: Arc<Client>) -> Self {
-        Self { client }
+        Self {
+            client,
+            io_runtime: None,
+        }
     }
 
     /// Creates a new HdfsObjectStore using the specified URL
@@ -73,10 +152,9 @@ impl HdfsObjectStore {
     /// # Ok(())
     /// # }
     /// ```
+    #[deprecated(since = "1.1.0", note = "Use HdfsObjectStoreBuilder instead")]
     pub fn with_url(url: &str) -> Result<Self> {
-        Ok(Self::new(Arc::new(
-            Client::with_url(url).to_object_store_err()?,
-        )))
+        HdfsObjectStoreBuilder::new().with_url(url).build()
     }
 
     /// Creates a new HdfsObjectStore using the specified URL and Hadoop configs.
@@ -91,13 +169,16 @@ impl HdfsObjectStore {
     ///     ("dfs.namenode.rpc-address.ns.nn1".to_string(), "nn1.example.com:9000".to_string()),
     ///     ("dfs.namenode.rpc-address.ns.nn2".to_string(), "nn2.example.com:9000".to_string()),
     /// ]);
+    /// let store = HdfsObjectStore::with_config("hdfs://ns", config)?;
     /// # Ok(())
     /// # }
     /// ```
+    #[deprecated(since = "1.1.0", note = "Use HdfsObjectStoreBuilder instead")]
     pub fn with_config(url: &str, config: HashMap<String, String>) -> Result<Self> {
-        Ok(Self::new(Arc::new(
-            Client::with_config(url, config).to_object_store_err()?,
-        )))
+        HdfsObjectStoreBuilder::new()
+            .with_url(url)
+            .with_config(config)
+            .build()
     }
 
     async fn internal_copy(&self, from: &Path, to: &Path, overwrite: bool) -> Result<()> {
@@ -212,6 +293,7 @@ impl ObjectStore for HdfsObjectStore {
 
     /// Create a multipart writer that writes to a temporary file in a background task, and renames
     /// to the final destination on complete.
+    #[allow(deprecated)]
     async fn put_multipart_opts(
         &self,
         location: &Path,
@@ -226,6 +308,7 @@ impl ObjectStore for HdfsObjectStore {
             Arc::new(tmp_file),
             &tmp_file_path,
             &final_file_path,
+            self.io_runtime.clone(),
         )))
     }
 
@@ -474,10 +557,11 @@ impl HdfsMultipartWriter {
         writer: Arc<FileWriter>,
         tmp_filename: &str,
         final_filename: &str,
+        io_runtime: Option<Handle>,
     ) -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
 
-        let writer_handle = Self::start_writer_task(Arc::clone(&writer), receiver);
+        let writer_handle = Self::start_writer_task(Arc::clone(&writer), receiver, io_runtime);
 
         Self {
             client,
@@ -490,8 +574,9 @@ impl HdfsMultipartWriter {
     fn start_writer_task(
         writer: Arc<FileWriter>,
         mut part_receiver: mpsc::UnboundedReceiver<(oneshot::Sender<Result<()>>, PutPayload)>,
+        io_runtime: Option<Handle>,
     ) -> JoinHandle<Result<()>> {
-        task::spawn(async move {
+        let future = async move {
             'outer: loop {
                 match part_receiver.recv().await {
                     Some((sender, part)) => {
@@ -522,7 +607,12 @@ impl HdfsMultipartWriter {
                 "Write failed during one of the parts".to_string(),
             ))
             .to_object_store_err()
-        })
+        };
+
+        match io_runtime {
+            Some(handle) => handle.spawn(future),
+            None => tokio::task::spawn(future),
+        }
     }
 }
 
