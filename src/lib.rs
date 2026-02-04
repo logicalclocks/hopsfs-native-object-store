@@ -316,15 +316,9 @@ impl ObjectStore for HdfsObjectStore {
 
     /// Reads data for the specified location.
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-        if options.if_match.is_some()
-            || options.if_none_match.is_some()
-            || options.if_modified_since.is_some()
-            || options.if_unmodified_since.is_some()
-        {
-            return Err(object_store::Error::NotImplemented);
-        }
-
         let meta = self.head(location).await?;
+
+        options.check_preconditions(&meta)?;
 
         let range = options
             .range
@@ -467,6 +461,18 @@ impl ObjectStore for HdfsObjectStore {
 
     /// Renames a file. This operation is guaranteed to be atomic.
     async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        // Make sure the parent directory exists
+        let mut parent: Vec<_> = to.parts().collect();
+        parent.pop();
+
+        if !parent.is_empty() {
+            let parent_path: Path = parent.into_iter().collect();
+            self.client
+                .mkdir(&make_absolute_dir(&parent_path))
+                .await
+                .to_object_store_err()?;
+        }
+
         Ok(self
             .client
             .rename(&make_absolute_file(from), &make_absolute_file(to), true)
