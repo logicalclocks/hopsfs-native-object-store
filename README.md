@@ -1,22 +1,17 @@
-# HDFS Native Object Store
-An [object_store](https://docs.rs/object_store/latest/object_store/) implementation for HDFS based on the native Rust [hdfs-native](https://github.com/Kimahriman/hdfs-native) library.
+# HopsFS Object Store
+An [object_store](https://docs.rs/object_store/latest/object_store/) implementation for HopsFS/HDFS using libhdfs Go client bindings.
+
+This is a fork of [hdfs-native-object-store](https://github.com/datafusion-contrib/hdfs-native-object-store) modified to use HopsFS Go client libraries instead of the native Rust hdfs-native library.
 
 # Compatibility
-Each release supports a certain minor release of both the `object_store` crate and the underlying `hdfs-native` client.
-
-|hdfs-native-object-store|object_store|hdfs-native|
-|---|---|---|
-|0.9.x|0.9|0.9|
-|0.10.x|0.10|0.9|
-|0.11.x|0.10|0.10|
-|0.12.x|>=0.10, <0.12|0.10|
-|0.13.x|>=0.10, <0.12|0.11|
-|0.14.x|0.12|0.11|
+|hopsfs-object-store|object_store|
+|---|---|
+|1.0.x|>=0.12.2, <0.13|
 
 # Usage
 ```rust
 use hdfs_native_object_store::HdfsObjectStore;
-let store = HdfsObjectStore::with_url("hdfs://localhost:9000")?;
+let store = HdfsObjectStore::with_url("hdfs://localhost:8020")?;
 ```
 
 # Documentation

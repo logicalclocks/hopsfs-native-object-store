@@ -104,7 +104,7 @@ mod test {
             .await?;
 
         let get_opts = GetOptions {
-            range: Some(GetRange::Suffix(buf_le)),
+            range: Some(GetRange::Suffix(buf_le as u64)),
             ..Default::default()
         };
 
