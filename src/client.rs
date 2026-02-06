@@ -5,7 +5,7 @@ use crate::native;
 use crate::native::{hdfsFS, hdfsFile, hdfsFileInfo, tObjectKind, tSize};
 use bytes::Bytes;
 use futures::stream::Stream;
-use libc::{c_int, c_short, c_ushort, c_void, int32_t};
+use libc::{c_int, c_short, c_ushort, c_void};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
@@ -14,6 +14,7 @@ use std::task::{Context, Poll};
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::runtime::Handle;
 use tokio::task;
 
 const DATA_BLOCK_SIZE: usize = 65536;
@@ -130,14 +131,16 @@ pub struct FileWriter {
     connection: Arc<Connection>,
     file: Arc<AtomicPtr<hdfsFile>>,
     closed: AtomicBool,
+    io_runtime: Option<Handle>,
 }
 
 impl FileWriter {
-    pub fn new(connection: Arc<Connection>, file: *mut hdfsFile) -> Self {
+    pub fn new(connection: Arc<Connection>, file: *mut hdfsFile, io_runtime: Option<Handle>) -> Self {
         FileWriter {
             connection,
             file: Arc::new(AtomicPtr::new(file)),
             closed: AtomicBool::new(false),
+            io_runtime,
         }
     }
     pub fn get_file_ptr(&self) -> *const hdfsFile {
@@ -147,7 +150,8 @@ impl FileWriter {
     pub async fn hdfs_write(&self, buf: Bytes) -> Result<()> {
         let file_ptr = self.get_file_ptr() as usize;
         let connection = Arc::clone(&self.connection);
-        let res = task::spawn_blocking(move || {
+
+        let res = self.spawn_blocking(move || {
             let buf_ptr = buf.as_ptr().cast::<c_void>();
             let buf_len = buf.len() as tSize;
             unsafe {
@@ -173,7 +177,8 @@ impl FileWriter {
     pub async fn close_file(&self) -> Result<()> {
         let file_ptr = self.get_file_ptr() as usize;
         let connection = Arc::clone(&self.connection);
-        let res = task::spawn_blocking(move || unsafe {
+
+        let res = self.spawn_blocking(move || unsafe {
             native::hdfsCloseFile(connection.get_conn_ptr(), file_ptr as *const hdfsFile)
         })
         .await;
@@ -185,6 +190,17 @@ impl FileWriter {
         }
         self.closed.store(true, Ordering::SeqCst);
         Ok(())
+    }
+
+    fn spawn_blocking<F, R>(&self, f: F) -> task::JoinHandle<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        match &self.io_runtime {
+            Some(handle) => handle.spawn_blocking(f),
+            None => task::spawn_blocking(f),
+        }
     }
 }
 
@@ -219,6 +235,7 @@ impl Connection {
 pub struct HopsClient {
     pub hdfs_internal: Arc<Vec<Arc<Connection>>>,
     next_conn_idx: AtomicUsize,
+    io_runtime: Option<Handle>,
 }
 
 impl Drop for HopsClient {
@@ -238,17 +255,38 @@ impl Drop for HopsClient {
 }
 
 impl HopsClient {
-    pub fn with_url(url: &str) -> Result<Self> {
+    /// Create a new HopsClient with the specified URL, optional config, and optional IO runtime
+    pub fn new(
+        url: &str,
+        config: Option<HashMap<String, String>>,
+        io_runtime: Option<Handle>,
+    ) -> Result<Self> {
         let mut connections = Vec::with_capacity(MAX_CONNECTIONS);
         for _ in 0..MAX_CONNECTIONS {
-            let fs = Self::hopsfs_connect_with_url(url)?;
+            let fs = match &config {
+                Some(cfg) => Self::hopsfs_connect_with_config(url, cfg)?,
+                None => Self::hopsfs_connect_with_url(url)?,
+            };
             let connection = Arc::new(Connection::new(fs));
             connections.push(connection);
         }
         Ok(HopsClient {
             hdfs_internal: Arc::new(connections),
             next_conn_idx: AtomicUsize::new(0),
+            io_runtime,
         })
+    }
+
+    /// Create a new HopsClient using the specified URL
+    #[deprecated(since = "1.1.0", note = "Use HopsClient::new() instead")]
+    pub fn with_url(url: &str) -> Result<Self> {
+        Self::new(url, None, None)
+    }
+
+    /// Create a new HopsClient using the specified URL and Hadoop configs
+    #[deprecated(since = "1.1.0", note = "Use HopsClient::new() instead")]
+    pub fn with_config(url: &str, config: HashMap<String, String>) -> Result<Self> {
+        Self::new(url, Some(config), None)
     }
 
     pub fn get_connection(&self) -> Arc<Connection> {
@@ -294,19 +332,6 @@ impl HopsClient {
         )))
     }
 
-    pub fn with_config(url: &str, config: HashMap<String, String>) -> Result<Self> {
-        let mut connections = Vec::with_capacity(MAX_CONNECTIONS);
-        for _ in 0..MAX_CONNECTIONS {
-            let fs = Self::hopsfs_connect_with_config(url, &config)?;
-            let connection = Arc::new(Connection::new(fs));
-            connections.push(connection);
-        }
-        Ok(HopsClient {
-            hdfs_internal: Arc::new(connections),
-            next_conn_idx: AtomicUsize::new(0),
-        })
-    }
-
     fn hopsfs_connect_with_config(
         url: &str,
         config: &HashMap<String, String>,
@@ -349,7 +374,8 @@ impl HopsClient {
     pub async fn check_file_exists(&self, path: &str) -> Result<bool> {
         let connection = self.get_connection();
         let c_path = CString::new(path).unwrap();
-        let res = task::spawn_blocking(move || unsafe {
+
+        let res = self.spawn_blocking(move || unsafe {
             let result = native::hdfsExists(connection.get_conn_ptr(), c_path.as_ptr());
             result == 0
         })
@@ -362,51 +388,51 @@ impl HopsClient {
         }
         Ok(res.unwrap())
     }
+
     pub async fn get_file_info(&self, path: &str) -> Result<FileStatus> {
+        let refined_path = CString::new(path).unwrap();
+        let path_owned = path.to_string();
+        let connection = self.get_connection();
 
-            let refined_path = CString::new(path).unwrap();
-            let path_owned = path.to_string();
-            let connection = self.get_connection();
+        let file_status = self.spawn_blocking(move || unsafe {
+            let path_info =
+                native::hdfsGetPathInfo(connection.get_conn_ptr(), refined_path.as_ptr());
 
-            let file_status = task::spawn_blocking(move || unsafe {
-                let path_info =
-                    native::hdfsGetPathInfo(connection.get_conn_ptr(), refined_path.as_ptr());
+            if path_info.is_null() {
+                return Err(HdfsError::FileNotFound(path_owned));
+            }
 
-                if path_info.is_null() {
-                    return Err(HdfsError::FileNotFound(path_owned));
-                }
+            let owner = CStr::from_ptr((*path_info).mOwner)
+                .to_str()
+                .ok()
+                .map(|s| s.to_owned());
 
-                let owner = CStr::from_ptr((*path_info).mOwner)
-                    .to_str()
-                    .ok()
-                    .map(|s| s.to_owned());
+            let group = CStr::from_ptr((*path_info).mGroup)
+                .to_str()
+                .ok()
+                .map(|s| s.to_owned());
 
-                let group = CStr::from_ptr((*path_info).mGroup)
-                    .to_str()
-                    .ok()
-                    .map(|s| s.to_owned());
+            let status = FileStatus {
+                path: path_owned,
+                length: (*path_info).mSize as usize,
+                isdir: (*path_info).mKind == tObjectKind::kObjectKindDirectory,
+                permission: (*path_info).mPermissions as u16,
+                owner: owner.unwrap(),
+                group: group.unwrap(),
+                modification_time: (*path_info).mLastMod as u64,
+                access_time: (*path_info).mLastAccess as u64,
+                replication: Some((*path_info).mReplication as u32),
+                blocksize: Some((*path_info).mBlockSize as u64),
+            };
 
-                let status = FileStatus {
-                    path: path_owned,
-                    length: (*path_info).mSize as usize,
-                    isdir: (*path_info).mKind == tObjectKind::kObjectKindDirectory,
-                    permission: (*path_info).mPermissions as u16,
-                    owner: owner.unwrap(),
-                    group: group.unwrap(),
-                    modification_time: (*path_info).mLastMod as u64,
-                    access_time: (*path_info).mLastAccess as u64,
-                    replication: Some((*path_info).mReplication as u32),
-                    blocksize: Some((*path_info).mBlockSize as u64),
-                };
+            native::hdfsFreeFileInfo(path_info, 1);
 
-                native::hdfsFreeFileInfo(path_info, 1);
+            Ok(status)
+        })
+        .await
+        .map_err(|_| HdfsError::FileNotFound(path.to_string()))??;
 
-                Ok(status)
-            })
-            .await
-            .map_err(|_| HdfsError::FileNotFound(path.to_string()))??;
-
-            Ok(file_status)
+        Ok(file_status)
     }
 
     pub async fn open_for_read(&self, path: &str) -> Result<FileReader> {
@@ -417,7 +443,7 @@ impl HopsClient {
             .map_err(|_| HdfsError::OperationFailed("Invalid path".to_string()))?;
         let connection = self.get_connection();
 
-        let file_reader = task::spawn_blocking(move || unsafe {
+        let file_reader = self.spawn_blocking(move || unsafe {
             let hdfs_file = native::hdfsOpenFile(
                 connection.get_conn_ptr(),
                 c_path.as_ptr(),
@@ -450,15 +476,16 @@ impl HopsClient {
         let c_path = CString::new(path)
             .map_err(|_| HdfsError::OperationFailed("Invalid path".to_string()))?;
         let connection = self.get_connection();
+        let io_runtime = self.io_runtime.clone();
 
-        let file_writer = task::spawn_blocking(move || unsafe {
+        let file_writer = self.spawn_blocking(move || unsafe {
             let result = native::hdfsOpenFile(
                 connection.get_conn_ptr(),
                 c_path.as_ptr(),
                 O_WRONLY,
                 opts.buffer_size,
                 opts.replication.unwrap_or(0),
-                opts.block_size.unwrap_or(0) as int32_t,
+                opts.block_size.unwrap_or(0),
             );
 
             if result.is_null() {
@@ -466,7 +493,7 @@ impl HopsClient {
                     "Failed to create file".to_string(),
                 ))
             } else {
-                Ok(FileWriter::new(connection, result.cast_mut()))
+                Ok(FileWriter::new(connection, result.cast_mut(), io_runtime))
             }
         })
         .await
@@ -476,23 +503,23 @@ impl HopsClient {
     }
 
     pub async fn rename(&self, from: &str, to: &str, overwrite: bool) -> Result<()> {
-            let destination_exists = self.check_file_exists(to).await?;
-            if destination_exists && !overwrite {
-                Err(HdfsError::AlreadyExists(to.to_string()))?
-            }
+        let destination_exists = self.check_file_exists(to).await?;
+        if destination_exists && !overwrite {
+            Err(HdfsError::AlreadyExists(to.to_string()))?
+        }
 
-            let _from = CString::new(from).unwrap();
-            let _to = CString::new(to).unwrap();
-            let connection = self.get_connection();
+        let _from = CString::new(from).unwrap();
+        let _to = CString::new(to).unwrap();
+        let connection = self.get_connection();
 
-            let res = task::spawn_blocking(move || unsafe {
-                native::hdfsRename(connection.get_conn_ptr(), _from.as_ptr(), _to.as_ptr())
-            })
-            .await;
+        let res = self.spawn_blocking(move || unsafe {
+            native::hdfsRename(connection.get_conn_ptr(), _from.as_ptr(), _to.as_ptr())
+        })
+        .await;
 
-            if res.is_err() || res.unwrap() != 0 {
-                return Err(HdfsError::OperationFailed("rename failed!".to_string()));
-            }
+        if res.is_err() || res.unwrap() != 0 {
+            return Err(HdfsError::OperationFailed("rename failed!".to_string()));
+        }
         Ok(())
     }
 
@@ -500,7 +527,7 @@ impl HopsClient {
         let _path = CString::new(path).unwrap();
         let connection = self.get_connection();
 
-        let res = task::spawn_blocking(move || unsafe {
+        let res = self.spawn_blocking(move || unsafe {
             native::hdfsDelete(
                 connection.get_conn_ptr(),
                 _path.as_ptr(),
@@ -565,7 +592,7 @@ impl HopsClient {
         let dst_cstr = CString::new(dst).unwrap();
         let connection = self.get_connection();
 
-        let res = task::spawn_blocking(move || unsafe {
+        let res = self.spawn_blocking(move || unsafe {
             let conn_ptr_usize = connection.get_conn_ptr();
             native::hdfsCopy(
                 conn_ptr_usize,
@@ -584,11 +611,12 @@ impl HopsClient {
             ))
         }
     }
+
     pub async fn mkdir(&self, path: &str) -> Result<()> {
         let path_cstr = CString::new(path).unwrap();
         let connection = self.get_connection();
 
-        let res = task::spawn_blocking(move || unsafe {
+        let res = self.spawn_blocking(move || unsafe {
             native::hdfsCreateDirectory(connection.get_conn_ptr(), path_cstr.as_ptr())
         })
         .await;
@@ -600,6 +628,17 @@ impl HopsClient {
         }
 
         Ok(())
+    }
+
+    fn spawn_blocking<F, R>(&self, f: F) -> task::JoinHandle<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        match &self.io_runtime {
+            Some(handle) => handle.spawn_blocking(f),
+            None => task::spawn_blocking(f),
+        }
     }
 }
 
