@@ -72,7 +72,7 @@ pub struct hdfsFileInfo {
 }
 
 #[link(name = "hdfs")]
-extern "C" {
+unsafe extern "C" {
 
     /// Determine if a file is open for read.
     ///
