@@ -1,12 +1,12 @@
 [package]
 name = "hdfs-native-object-store"
-version = "1.0.3"
-edition = "2021"
-authors = ["Adam Binford <adamq43@gmail.com>"]
-homepage = "https://github.com/datafusion-contrib/hdfs-native-object-store"
-repository = "https://github.com/datafusion-contrib/hdfs-native-object-store"
-keywords = ["hadoop", "hdfs", "object_store"]
-description = "object_store implementation for Native HDFS client"
+version = "1.1.0"
+edition = "2024"
+authors = ["Adam Binford <adamq43@gmail.com>", "Hamid Ghasemirahni <hamid@hopsworks.ai>", "Salman Niazi<salman@hopsworks.ai>"]
+homepage = "https://github.com/logicalclocks/hopsfs-native-object-store/tree/dev"
+repository = "https://github.com/logicalclocks/hopsfs-native-object-store/tree/dev"
+keywords = ["hadoop", "hopsfs", "object_store"]
+description = "object_store implementation for HopsFS client"
 readme = "README.md"
 license = "Apache-2.0"
 
