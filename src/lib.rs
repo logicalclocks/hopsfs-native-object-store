@@ -445,7 +445,7 @@ impl ObjectStore for HdfsObjectStore {
 
         let mut dirs: Vec<Path> = Vec::new();
         for status in statuses.iter().filter(|s| s.isdir) {
-            dirs.push(Path::parse(strip_scheme_authority(&status.path))?)
+            dirs.push(Path::parse(&status.path)?)
         }
 
         let mut files: Vec<ObjectMeta> = Vec::new();
@@ -713,23 +713,6 @@ fn make_absolute_dir(path: &Path) -> String {
     }
 }
 
-/// Strip the HDFS URL scheme and authority from a path returned by libhdfs.
-///
-/// libhdfs returns full URLs like `hdfs://host:port/path/to/file` in FileStatus.path,
-/// but `object_store::path::Path` expects only the filesystem path (e.g. `/path/to/file`).
-/// Passing the full URL causes a "contained empty path segment" error due to `://`.
-fn strip_scheme_authority(path: &str) -> &str {
-    if let Some(rest) = path
-        .strip_prefix("hdfs://")
-        .or_else(|| path.strip_prefix("hopsfs://"))
-    {
-        // Skip past the host:port portion to get the filesystem path
-        rest.find('/').map(|i| &rest[i..]).unwrap_or(rest)
-    } else {
-        path
-    }
-}
-
 /// Generate an ETag from file status using modification time and size.
 /// See: https://httpd.apache.org/docs/2.2/mod/core.html#fileetag
 fn get_etag(status: &FileStatus) -> String {
@@ -740,7 +723,7 @@ fn get_etag(status: &FileStatus) -> String {
 
 fn get_object_meta(status: &FileStatus) -> Result<ObjectMeta> {
     Ok(ObjectMeta {
-        location: Path::parse(strip_scheme_authority(&status.path))?,
+        location: Path::parse(&status.path)?,
         last_modified: DateTime::<Utc>::from_timestamp(status.modification_time as i64, 0).unwrap(),
         size: status
             .length
