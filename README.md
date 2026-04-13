@@ -4,10 +4,11 @@ An [object_store](https://docs.rs/object_store/latest/object_store/) implementat
 This is a fork of [hdfs-native-object-store](https://github.com/datafusion-contrib/hdfs-native-object-store) modified to use HopsFS Go client libraries instead of the native Rust hdfs-native library.
 
 # Compatibility
-| hopsfs-object-store | Upstream Version | object_store    | HopsFS            |
-|---------------------|------------------|-----------------|-------------------|
-| 1.1.0               | 0.15.x           | >=0.12.2, <0.13 | 3.2.0.18-EE-RC1   |
-| 1.0.3               | 0.14.x           | 0.12            | 3.2.0.18-SNAPSHOT |
+| hopsfs-object-store | Upstream Version | object_store    | HopsFS                             |
+|---------------------|------------------|-----------------|------------------------------------|
+| 1.1.1               | 0.15.x           | >=0.12.2, <0.13 | >=3.2.0.18-EE-RC1, <3.4.3.0-EE-RC0 |
+| 1.1.0               | 0.15.x           | >=0.12.2, <0.13 | 3.2.0.18-EE-RC1                    |
+| 1.0.3               | 0.14.x           | 0.12            | 3.2.0.18-SNAPSHOT                  |
 
 # Usage
 ```rust
