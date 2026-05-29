@@ -13,8 +13,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     println!("cargo:rerun-if-env-changed={}", LIB_DIR_ENV);
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
     println!("cargo:rerun-if-changed=HOPS_VERSION");
     println!("cargo:rerun-if-changed=build.rs");
+
+    // docs.rs builds in an offline sandbox and only runs `cargo doc`, which
+    // never invokes the linker — so we skip downloading libhdfs and emitting
+    // link directives entirely.
+    if env::var("DOCS_RS").is_ok() {
+        return Ok(());
+    }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     let lib_dir = resolve_lib_dir(&out_dir)?;
