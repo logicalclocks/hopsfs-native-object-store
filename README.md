@@ -12,7 +12,7 @@ This is a fork of [hdfs-native-object-store](https://github.com/datafusion-contr
 
 # Usage
 ```rust
-use hdfs_native_object_store::HdfsObjectStoreBuilder;
+use hopsfs_native_object_store::HdfsObjectStoreBuilder;
 let store = HdfsObjectStoreBuilder::new()
     .with_url("hdfs://localhost:8020")
     .build()?;
