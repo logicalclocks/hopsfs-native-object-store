@@ -1,6 +1,6 @@
 [package]
 name = "hopsfs-native-object-store"
-version = "1.2.1"
+version = "1.2.2"
 edition = "2024"
 authors = ["Adam Binford <adamq43@gmail.com>", "Hamid Ghasemirahni <hamid@hopsworks.ai>", "Salman Niazi<salman@hopsworks.ai>"]
 homepage = "https://github.com/logicalclocks/hopsfs-native-object-store/tree/dev"
@@ -27,6 +27,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "sync", "time"] }
 libc = "0.2"
 async-stream = "0.3.6"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 env_logger = "0.11"
